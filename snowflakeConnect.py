@@ -96,9 +96,6 @@ class snowInterface:
     # credentials
     __credentials = snowCredentials(None, None, None)
 
-    # Set false to NOT create missing columns from source table onto target table. Default: false
-    autoCreateMissingColumns = True
-    
 
     def __init__(self, credentials):
         self.openInterface(credentials)
@@ -284,7 +281,8 @@ class snowInterface:
                     #                             }
                     #                         ]
                     # }
-    def snowUpsert(self, targetTbl, source, joinExp, upsertConditions):
+    # Set autoCreateMissingColumns false to NOT create missing columns from source table onto target table. Default: false   
+    def snowUpsert(self, targetTbl, source, joinExp, upsertConditions, autoCreateMissingColumns=False):
         
         print ('snowUpsert')
 
@@ -319,7 +317,7 @@ class snowInterface:
 
         # Check if additional columns need to be created in target table
         headerCompare = self.compareTableHeaders(headersMap, source['headers'])
-        if headerCompare == False and self.autoCreateMissingColumns == True:
+        if headerCompare == False and autoCreateMissingColumns == True:
             self.addColumn(targetTbl, source['headers'])
         elif headerCompare == False:
             raise Exception("Columns in Target table {} are missing in source.".format(targetTbl))
@@ -455,11 +453,34 @@ class snowInterface:
             print ("An exception occured when dropping the table. Exception {}".format(e))
             self.closeInterface()
 
+    def __rowInsertValidator(self, recordArray, headerMap):
+        recordStr = ''
+        for record in recordArray:
+            recordStr = ''
+            for head in headerMap.keys():
+                val = None
+                if head in record:
+                    val = record[head]
+                else:
+                    continue
+                
+                if val == None or val == '':
+                    recordStr = '{}NULL'.format(recordStr)
+                elif isinstance(val, str) == False:
+                    recordStr = '{}{}'.format(recordStr, str(val))
+                elif val.find("$") >= 0:
+                    val.removeInvalidChar(val)
+                    val = "'{}'".format(val)
+                else:
+                    val = "$${}$$".format(val)
+                    recordStr = '{}{}'.format(recordStr, val)
+
+            yield recordStr
+
 
     # recordArray shoud be [{col1:val1,col2:val2,...},...]
     def insertRows(self, tableName, recordArray):
-        singleExecuteRowLimit = 0
-        singleExecuteList = []
+        singleExecuteRowLimit = 15000
         print ('Inserting Rows')
         if not tableName:
             raise ValueError("Table name was Null or blank")
@@ -472,55 +493,26 @@ class snowInterface:
 
         headersMap = self.getTableHeaders(tableName)
 
-        valueStr = ''
+        executionStr = ''
         keyStr = '({})'.format(','.join(headersMap.keys()))
 
-        for obj in recordArray:
-            valueStr = "{}(".format(valueStr)
-            for key in headersMap.keys():
-                val = None
+        rows = self.__rowInsertValidator(recordArray, headersMap)
 
-                if key in obj:
-                    val = obj[key]
+        for i,row in enumerate(rows):
+            
+            if (i+1)%singleExecuteRowLimit == 0:
+                try:
+                    insertStr = "INSERT INTO {} {} VALUES {}".format(tableName, keyStr, executionStr)
+                    self.__cnx.cursor().execute(insertStr)
+                    print('\t Inserted Batch')
+                except Exception as e:
+                    print ("An error occured when inserting records. \n {}".format(e))
+                    print (traceback.format_exc())
+                    self.closeInterface()
+                time.sleep(.05)
+                executionStr = ''
 
-                if val == None or val == '':
-                    valueStr ='{}NULL'.format(valueStr)
-                elif isinstance(val, str) == False:
-                    valueStr = '{}{}'.format(valueStr, str(val))
-                else:
-                    if val.find("$") >= 0:
-                        val = removeInvalidChar(val)
-                        val = "'{}'".format(val)
-                    else:
-                        val = "$${}$$".format(val)
-                    valueStr = '{}{}'.format(valueStr, val)
-
-                valueStr = '{},'.format(valueStr)
-            valueStr = valueStr[:-1]
-            valueStr = "{}),".format(valueStr)
-
-            singleExecuteRowLimit = singleExecuteRowLimit + 1
-            if singleExecuteRowLimit == 1500:
-                valueStr = valueStr[:-1]
-                singleExecuteList.append(valueStr)
-                valueStr = ''
-                singleExecuteRowLimit = 0
-        
-        valueStr = valueStr[:-1]
-
-        if valueStr != '':
-            singleExecuteList.append(valueStr)
-
-        for execution in singleExecuteList:
-            try:
-                insertStr = "INSERT INTO {} {} VALUES {}".format(tableName, keyStr, execution)
-                self.__cnx.cursor().execute(insertStr)
-                print('\t Inserted Batch')
-            except Exception as e:
-                print ("An error occured when inserting records. \n {}".format(e))
-                print (traceback.format_exc())
-                self.closeInterface()
-            time.sleep(.05)
+            executionStr = ','.join([executionStr, '({})'.join(row)])
 
             
     def queryRecords(self, query):
